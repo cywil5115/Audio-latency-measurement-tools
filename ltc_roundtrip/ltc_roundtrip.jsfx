@@ -1,0 +1,817 @@
+desc: AudioNet-Gda LTC Round-Trip Monitor v3.0 (single plugin, no transport)
+//tags: analysis meter synchronisation generator
+//author: Department of Multimedia Systems, Gdansk University of Technology
+options:gmem=audionet_gda
+
+// v3.0 -- SUITE VERSION. mls_roundtrip.jsfx and ltc_roundtrip.jsfx now share
+// one architecture, which is what the major bump marks:
+//     single plugin - no transport - free-running internal counter -
+//     median/MAD outlier gate - running statistics - gmem telemetry
+// They differ only in modulation (biphase-mark timecode vs MLS correlation)
+// and therefore in update rate and robustness.
+//
+// MERGED encoder + decoder in ONE plugin, timestamped from an INTERNAL
+// free-running sample counter instead of play_position. Consequences:
+//   * No transport required and no MTC/MIDI/sync of any kind: the plugin runs
+//     whenever it processes audio, exactly like mls_roundtrip.jsfx. Ideal for
+//     monitoring a live session with the Reaper transport stopped.
+//   * One plugin on one track (input from the returning Dante flow, output to
+//     the outbound flow); the far end runs a trivial passthrough. No second
+//     plugin to keep in the same fps mode, no serial-FX-chain hazard.
+//   * The play_position block-start reconstruction jitter and the record-pause
+//     edge case are gone by construction (there is no play_position).
+//   * Because encode and decode share ONE internal counter, the round-trip
+//     delay is the counter difference alone -- no shared external clock, no
+//     start-offset problem (the counter never leaves this plugin). Two
+//     SEPARATE plugins could not do this without reintroducing that problem,
+//     which is why the encoder/decoder are merged.
+// This is a ROUND-TRIP monitor: it reports round-trip and round-trip/2 (one-
+// way under a path-symmetry assumption), same as before -- it does not and
+// cannot recover per-direction one-way.
+//
+// Retains all v2.2 decode machinery: polarity-pair bit decisions tolerant of
+// A/C filtering; frame-continuity gate (payload must advance by k*frame, k<=8,
+// +/-1 sample; k-1 = dropped frames); boundary-vote phase-lock correction;
+// mod-2^32 latency unwrap; median/MAD outlier gate (A5); running stats incl.
+// RFC 3393 IPDV and p50/p95/p99 (B2); gmem telemetry for the CSV logger (B4).
+// The internal counter is float64-exact for ~1.9 years at 48 kHz; the 32-bit
+// payload wraps at 24.85 h and is unwrapped by the decode path.
+
+slider1:0<0,3,1{500 fps / 2 spb,250 fps / 4 spb,125 fps / 8 spb,62.5 fps / 16 spb}>FPS mode (TX and RX)
+slider2:20<1,100,0.5>Display range (ms)
+slider3:0<-20,20,0.001>Manual offset correction (ms)
+slider4:8<2,32,1>Confidence frames before reporting
+slider5:0.01<0.001,0.2,0.001>Input level threshold
+slider6:100<10,500,1>Connection timeout (ms)
+slider7:6<0,16,0.5>Outlier gate (k x MAD, 0 = off)
+slider8:0.5<0.05,1.0,0.01>Output amplitude
+
+@init
+// Keep state across playback starts (REAPER re-runs @init per play without
+// this, wiping statistics and restarting the telemetry seq counter, which
+// stalls the CSV logger).  Lock state self-heals via its own timeouts.
+ext_noinit          = 1;
+
+DATA_BITS           = 32;
+SYNC_BITS           = 16;
+FRAME_BITS          = 48;
+SYNC_WORD           = 16381;
+POW2_31             = 2147483648;
+POW2_15             = 32768;
+
+MAX_PHASES          = 16;
+RING_SIZE           = 4096;  // multiple of every SAMPLES_PER_BIT mode
+MAX_SKIP            = 8;     // continuity gate: max accepted frame step
+VOTE_SLOTS          = 17;    // boundary-offset votes, indexed e + 8
+OW_LEN              = 32;    // outlier-gate window (accepted values)
+
+hist_size           = 512;
+hist                = 0;
+decode_ring         = hist + hist_size;
+phase_shift_lo      = decode_ring + RING_SIZE;
+phase_shift_hi      = phase_shift_lo + MAX_PHASES;
+phase_bits_seen     = phase_shift_hi + MAX_PHASES;
+phase_votes         = phase_bits_seen + MAX_PHASES;
+ow_ring             = phase_votes + VOTE_SLOTS;
+ow_scratch          = ow_ring + OW_LEN;
+gfx_scratch         = ow_scratch + OW_LEN;   // 512 slots, GUI thread only
+tx_bits_buf         = gfx_scratch + hist_size;  // 48 transmit bits
+memset(hist, 0, hist_size);
+memset(decode_ring, 0, RING_SIZE);
+memset(phase_shift_lo, 0, MAX_PHASES);
+memset(phase_shift_hi, 0, MAX_PHASES);
+memset(phase_bits_seen, 0, MAX_PHASES);
+memset(phase_votes, 0, VOTE_SLOTS);
+
+function insertion_sort(buf, n) local(i, j, v) (
+    i = 1;
+    while (i < n) (
+        v = buf[i];
+        j = i - 1;
+        while ((j >= 0) && (buf[j] > v)) (
+            buf[j + 1] = buf[j];
+            j -= 1;
+        );
+        buf[j + 1] = v;
+        i += 1;
+    );
+);
+
+// @gfx-only copy: EEL2 function locals are STATIC, so one sort shared between
+// the audio thread (outlier gate) and the UI thread (percentiles) would race
+function insertion_sort_gfx(buf, n) local(i, j, v) (
+    i = 1;
+    while (i < n) (
+        v = buf[i];
+        j = i - 1;
+        while ((j >= 0) && (buf[j] > v)) (
+            buf[j + 1] = buf[j];
+            j -= 1;
+        );
+        buf[j + 1] = v;
+        i += 1;
+    );
+);
+
+// @gfx-only
+function sorted_pct(buf, n, p) local(idx) (
+    idx = floor(p * (n - 1) + 0.5);
+    buf[idx];
+);
+
+// median and MAD of the outlier window -> g_med, g_mad
+function window_median_mad() local(i, n) (
+    n = ow_count;
+    i = 0;
+    loop(n, ow_scratch[i] = ow_ring[i]; i += 1; );
+    insertion_sort(ow_scratch, n);
+    g_med = (n % 2) ? ow_scratch[floor(n/2)]
+                    : 0.5 * (ow_scratch[n/2 - 1] + ow_scratch[n/2]);
+    i = 0;
+    loop(n, ow_scratch[i] = abs(ow_scratch[i] - g_med); i += 1; );
+    insertion_sort(ow_scratch, n);
+    g_mad = (n % 2) ? ow_scratch[floor(n/2)]
+                    : 0.5 * (ow_scratch[n/2 - 1] + ow_scratch[n/2]);
+);
+
+function ltc_stats_reset() (
+    ow_count = 0;
+    ow_pos = 0;
+    w_n = 0; w_mean = 0; w_m2 = 0;
+    stat_min = 0; stat_max = 0;
+    ipdv_n = 0; ipdv_mean = 0; ipdv_m2 = 0; ipdv_max_abs = 0; ipdv_last = 0;
+    consecutive_outlier_rejects = 0;
+    hist_filled = 0;
+);
+
+hist_pos            = 0;
+sample_clock        = 0;    // the internal free-running timebase (samples)
+ring_pos            = -1;   // maintained wrapping index; EEL2 % on an
+                            // unbounded clock has platform-dependent width
+dc_estimate         = 0;
+
+// ---- transmit (encoder) state --------------------------------------------
+tx_level            = 1;
+tx_bit_pos          = 0;
+tx_bit_index        = 0;
+tx_frame_lo         = 0;
+tx_frame_count      = 0;
+tx_reset_done       = 0;    // one-shot frame-state reset when TX is off
+generator_enabled   = 1;
+mouse_left_was_down = 0;
+// sync bits (frame bits 32..47) are constant; precompute them once (arithmetic
+// only, per the shift-register convention -- never bitwise on the payload path)
+tx_tmp = SYNC_WORD;
+tx_i = DATA_BITS;
+loop(SYNC_BITS,
+    tx_bits_buf[tx_i] = tx_tmp - floor(tx_tmp / 2) * 2;
+    tx_tmp = floor(tx_tmp / 2);
+    tx_i += 1;
+);
+
+dropped_frames      = 0;
+rejected_syncs      = 0;
+consecutive_rejects = 0;
+last_accepted_payload = -1;
+phase_err           = 0;
+rejected_outliers   = 0;
+tele_seq            = 0;
+tele_ring_idx       = 0;
+ltc_stats_reset();
+
+locked_phase        = -1;
+confidence          = 0;
+n_frames_locked     = 0;
+n_frames_total      = 0;
+n_violations        = 0;
+payload             = 0;
+latency_samples     = 0;
+latency_ms          = 0;
+last_sync_tick      = -1;
+last_signal_tick    = -1;
+ever_seen_ltc       = 0;
+
+meter_peak          = 0;
+meter_rms_acc       = 0;
+meter_count         = 0;
+display_peak        = 0;
+display_rms         = 0;
+
+mode_prev           = -1;
+mode_sel            = floor(slider1 + 0.5);
+mode_sel == 0 ? SAMPLES_PER_BIT = 2 :
+mode_sel == 1 ? SAMPLES_PER_BIT = 4 :
+mode_sel == 2 ? SAMPLES_PER_BIT = 8 :
+SAMPLES_PER_BIT = 16;
+SAMPLES_PER_FRAME   = FRAME_BITS * SAMPLES_PER_BIT;
+mode_fps            = srate / SAMPLES_PER_FRAME;
+sample_ms           = 1000 / srate;
+bit_ms              = SAMPLES_PER_BIT * sample_ms;
+frame_ms            = SAMPLES_PER_FRAME * sample_ms;
+q1_pos              = max(0, floor(SAMPLES_PER_BIT * 0.25));
+q3_pos              = min(SAMPLES_PER_BIT - 1, floor(SAMPLES_PER_BIT * 0.75));
+mid_pos             = floor(SAMPLES_PER_BIT / 2);
+// offsets at which the q1/q3 probes still decode valid bits (the phase
+// ambiguity range the boundary vote disambiguates)
+e_early             = min(q1_pos, q3_pos - mid_pos);
+e_late              = min(mid_pos - 1 - q1_pos, SAMPLES_PER_BIT - 1 - q3_pos);
+
+max_disp            = slider2;
+offset_ms           = slider3;
+offset_prev         = offset_ms;
+required_confidence = slider4;
+input_threshold     = slider5;
+connection_timeout_ms = slider6;
+outlier_k           = slider7;
+amplitude           = slider8;
+mode_prev           = mode_sel;
+
+@slider
+mode_sel            = floor(slider1 + 0.5);
+max_disp            = slider2;
+offset_ms           = slider3;
+required_confidence = slider4;
+input_threshold     = slider5;
+connection_timeout_ms = slider6;
+outlier_k           = slider7;
+amplitude           = slider8;
+
+// changing the offset shifts every value: restart the statistics
+offset_ms != offset_prev ? (
+    ltc_stats_reset();
+    offset_prev = offset_ms;
+);
+
+mode_sel != mode_prev ? (
+    mode_sel == 0 ? SAMPLES_PER_BIT = 2 :
+    mode_sel == 1 ? SAMPLES_PER_BIT = 4 :
+    mode_sel == 2 ? SAMPLES_PER_BIT = 8 :
+    SAMPLES_PER_BIT = 16;
+
+    SAMPLES_PER_FRAME = FRAME_BITS * SAMPLES_PER_BIT;
+    mode_fps          = srate / SAMPLES_PER_FRAME;
+    sample_ms         = 1000 / srate;
+    bit_ms            = SAMPLES_PER_BIT * sample_ms;
+    frame_ms          = SAMPLES_PER_FRAME * sample_ms;
+    q1_pos            = max(0, floor(SAMPLES_PER_BIT * 0.25));
+    q3_pos            = min(SAMPLES_PER_BIT - 1, floor(SAMPLES_PER_BIT * 0.75));
+    mid_pos           = floor(SAMPLES_PER_BIT / 2);
+    e_early           = min(q1_pos, q3_pos - mid_pos);
+    e_late            = min(mid_pos - 1 - q1_pos, SAMPLES_PER_BIT - 1 - q3_pos);
+
+    locked_phase      = -1;
+    confidence        = 0;
+    n_violations      = 0;
+    last_sync_tick    = -1;
+    dropped_frames    = 0;
+    rejected_syncs    = 0;
+    consecutive_rejects = 0;
+    last_accepted_payload = -1;
+    phase_err         = 0;
+    rejected_outliers = 0;
+    ltc_stats_reset();
+    memset(phase_shift_lo, 0, MAX_PHASES);
+    memset(phase_shift_hi, 0, MAX_PHASES);
+    memset(phase_bits_seen, 0, MAX_PHASES);
+    memset(phase_votes, 0, VOTE_SLOTS);
+    // restart the transmit frame cleanly at the new bit length
+    tx_level          = 1;
+    tx_bit_pos        = 0;
+    tx_bit_index      = 0;
+    mode_prev         = mode_sel;
+);
+
+@block
+meter_count > 0 ? (
+    display_peak   = meter_peak;
+    display_rms    = sqrt(meter_rms_acc / meter_count);
+);
+meter_peak          = 0;
+meter_rms_acc       = 0;
+meter_count         = 0;
+// no play_position read: the timebase is the internal free-running counter
+
+@sample
+// Read the returning LTC BEFORE we write this sample's outgoing LTC to spl0.
+in_sample           = spl0;
+
+// Internal free-running timebase: one counter drives BOTH the transmit stamp
+// (below) and the decode reference here, so their difference is the round-trip
+// delay with no play_position and no transport dependency.
+current_sample      = sample_clock;
+sample_clock       += 1;
+
+abs_raw             = abs(in_sample);
+meter_peak          = max(meter_peak, abs_raw);
+meter_rms_acc      += in_sample * in_sample;
+meter_count        += 1;
+
+abs_raw >= input_threshold ? last_signal_tick = sample_clock;
+
+// Lightweight DC removal before polarity tests.  This helps mic inputs and
+// any asymmetric analog stage without changing the timestamp path.
+dc_estimate         = dc_estimate * 0.999 + in_sample * 0.001;
+decode_sample       = in_sample - dc_estimate;
+ring_pos           += 1;
+ring_pos >= RING_SIZE ? ring_pos = 0;
+decode_ring[ring_pos] = decode_sample;
+
+delay_q1            = (SAMPLES_PER_BIT - 1) - q1_pos;
+delay_q3            = (SAMPLES_PER_BIT - 1) - q3_pos;
+idx_q1_base         = (ring_pos - delay_q1 + RING_SIZE) % RING_SIZE;
+idx_q3_base         = (ring_pos - delay_q3 + RING_SIZE) % RING_SIZE;
+
+// Re-acquire if a locked phase has stopped producing frame syncs.
+last_sync_tick >= 0 ? (
+    sync_gap_samples = sample_clock - last_sync_tick;
+    sync_gap_ms      = sync_gap_samples / srate * 1000;
+) : (
+    sync_gap_samples = 999999;
+    sync_gap_ms      = 999999;
+);
+adaptive_timeout_ms = max(connection_timeout_ms, (SAMPLES_PER_FRAME * 3) / srate * 1000);
+(locked_phase >= 0) && (sync_gap_ms > adaptive_timeout_ms) ? (
+    locked_phase = -1;
+    confidence = 0;
+    n_violations = 0;
+    consecutive_rejects = 0;
+    phase_err = 0;
+    memset(phase_shift_lo, 0, MAX_PHASES);
+    memset(phase_shift_hi, 0, MAX_PHASES);
+    memset(phase_bits_seen, 0, MAX_PHASES);
+    memset(phase_votes, 0, VOTE_SLOTS);
+);
+
+locked_phase < 0 ? (
+    p = 0;
+    loop(MAX_PHASES,
+        p < SAMPLES_PER_BIT ? (
+            // ring_pos tracks the sample clock mod RING_SIZE, and RING_SIZE
+            // is a multiple of SAMPLES_PER_BIT, so the phase is preserved
+            bit_pos = ring_pos - p;
+            bit_pos < 0 ? bit_pos += RING_SIZE;
+            bit_pos %= SAMPLES_PER_BIT;
+
+            bit_pos == (SAMPLES_PER_BIT - 1) ? (
+                v1 = decode_ring[idx_q1_base];
+                v2 = decode_ring[idx_q3_base];
+                valid_bit = (abs(v1) >= input_threshold) || (abs(v2) >= input_threshold);
+
+                valid_bit ? (
+                    new_bit = (v1 * v2) < 0 ? 1 : 0;
+
+                    phase_shift_lo[p] = floor(phase_shift_lo[p] / 2) + (phase_shift_hi[p] % 2) * POW2_31;
+                    phase_shift_hi[p] = floor(phase_shift_hi[p] / 2) + new_bit * POW2_15;
+                    phase_bits_seen[p] < FRAME_BITS ? phase_bits_seen[p] += 1;
+
+                    (phase_bits_seen[p] >= FRAME_BITS) && (phase_shift_hi[p] == SYNC_WORD) ? (
+                        locked_phase      = p;
+                        payload           = phase_shift_lo[p];
+                        local_frame_start = current_sample - (SAMPLES_PER_FRAME - 1);
+                        latency_samples   = local_frame_start - payload;
+                        // unwrap: the payload rolls over at 2^32 transport
+                        // samples (24.85 h @ 48 kHz), the local counter does not
+                        latency_samples  -= floor(latency_samples / 4294967296) * 4294967296;
+                        latency_samples < 0 ? latency_samples += 4294967296;
+                        latency_ms        = latency_samples / srate * 1000 + offset_ms;
+                        last_sync_tick    = sample_clock;
+                        ever_seen_ltc     = 1;
+                        confidence        = 1;
+                        n_frames_total    = 1;
+                        n_violations      = 0;
+                        last_accepted_payload = payload;
+                        consecutive_rejects   = 0;
+                        phase_err             = 0;
+                    );
+                ) : (
+                    phase_shift_lo[p] = 0;
+                    phase_shift_hi[p] = 0;
+                    phase_bits_seen[p] = 0;
+                );
+            );
+        );
+        p += 1;
+    );
+) : (
+    bit_pos = ring_pos - locked_phase;
+    bit_pos < 0 ? bit_pos += RING_SIZE;
+    bit_pos %= SAMPLES_PER_BIT;
+
+    bit_pos == (SAMPLES_PER_BIT - 1) ? (
+        // Boundary-offset votes: biphase mark flips level at every true cell
+        // boundary, so the offset that flips sign every bit is the true one.
+        (e_early > 0) || (e_late > 0) ? (
+            cell_start = ring_pos - (SAMPLES_PER_BIT - 1);
+            e = -e_late;
+            loop(e_early + e_late + 1,
+                ia = cell_start + e - 1;
+                ia < 0 ? ia += RING_SIZE;
+                ia >= RING_SIZE ? ia -= RING_SIZE;
+                ib = cell_start + e;
+                ib < 0 ? ib += RING_SIZE;
+                ib >= RING_SIZE ? ib -= RING_SIZE;
+                va = decode_ring[ia];
+                vb = decode_ring[ib];
+                (abs(va) >= input_threshold) && (abs(vb) >= input_threshold) && (va * vb < 0) ?
+                    phase_votes[e + 8] += 1;
+                e += 1;
+            );
+        );
+
+        v1 = decode_ring[idx_q1_base];
+        v2 = decode_ring[idx_q3_base];
+        valid_bit = (abs(v1) >= input_threshold) || (abs(v2) >= input_threshold);
+
+        valid_bit ? (
+            new_bit = (v1 * v2) < 0 ? 1 : 0;
+
+            phase_shift_lo[locked_phase] = floor(phase_shift_lo[locked_phase] / 2) + (phase_shift_hi[locked_phase] % 2) * POW2_31;
+            phase_shift_hi[locked_phase] = floor(phase_shift_hi[locked_phase] / 2) + new_bit * POW2_15;
+
+            phase_shift_hi[locked_phase] == SYNC_WORD ? (
+                payload_new = phase_shift_lo[locked_phase];
+
+                // Frame-continuity gate: true frames advance the payload by
+                // a positive multiple of SAMPLES_PER_FRAME.  The internal
+                // counter makes the step exact here (no play_position
+                // reconstruction), but the +/- 1 sample tolerance is kept as
+                // harmless defence (the false-match scan shows it costs zero
+                // extra false matches).
+                gate_delta = payload_new - last_accepted_payload;
+                gate_delta < 0 ? gate_delta += 4294967296;
+                gate_k = floor(gate_delta / SAMPLES_PER_FRAME + 0.5);
+                gate_res = gate_delta - gate_k * SAMPLES_PER_FRAME;
+
+                (gate_k >= 1) && (gate_k <= MAX_SKIP) && (abs(gate_res) <= 1) ? (
+                    // elect the boundary offset for this frame's votes
+                    (e_early > 0) || (e_late > 0) ? (
+                        best_v = -1;
+                        runner_v = -1;
+                        best_e = phase_err;
+                        e = -e_late;
+                        loop(e_early + e_late + 1,
+                            vv = phase_votes[e + 8];
+                            vv > best_v ? (
+                                runner_v = best_v;
+                                best_v = vv;
+                                best_e = e;
+                            ) : (
+                                vv > runner_v ? runner_v = vv;
+                            );
+                            e += 1;
+                        );
+                        (best_v >= FRAME_BITS / 2) && (best_v > runner_v) ? phase_err = best_e;
+                        memset(phase_votes, 0, VOTE_SLOTS);
+                    );
+
+                    payload           = payload_new;
+                    dropped_frames   += gate_k - 1;
+                    last_accepted_payload = payload_new;
+                    consecutive_rejects   = 0;
+                    local_frame_start = current_sample - (SAMPLES_PER_FRAME - 1) + phase_err;
+                    latency_samples   = local_frame_start - payload;
+                    latency_samples  -= floor(latency_samples / 4294967296) * 4294967296;
+                    latency_samples < 0 ? latency_samples += 4294967296;
+                    new_latency_ms    = latency_samples / srate * 1000 + offset_ms;
+                    last_sync_tick    = sample_clock;
+                    ever_seen_ltc     = 1;
+
+                    confidence < required_confidence ? (
+                        confidence += 1;
+                    ) : (
+                        // A5: median/MAD outlier gate before recording
+                        is_outlier = 0;
+                        (outlier_k > 0) && (ow_count >= 8) ? (
+                            window_median_mad();
+                            g_mad = max(g_mad, 0.042);  // floor ~2 samples RT @ 48 kHz
+                            abs(new_latency_ms - g_med) > outlier_k * g_mad ? is_outlier = 1;
+                        );
+                        is_outlier ? (
+                            rejected_outliers += 1;
+                            consecutive_outlier_rejects += 1;
+                            // persistent shift = real path change: restart stats
+                            consecutive_outlier_rejects >= 16 ? (
+                                ltc_stats_reset();
+                                is_outlier = 0;
+                            );
+                        );
+                        is_outlier == 0 ? (
+                            // B2: RFC 3393 IPDV against the previous ACCEPTED
+                            // value (a dedicated baseline: the acquisition
+                            // path writes latency_ms ungated, which would
+                            // pollute the first IPDV sample after a re-lock)
+                            w_n > 0 ? (
+                                ipdv_last = new_latency_ms - prev_reported_ms;
+                                ipdv_n += 1;
+                                d2 = ipdv_last - ipdv_mean;
+                                ipdv_mean += d2 / ipdv_n;
+                                ipdv_m2 += d2 * (ipdv_last - ipdv_mean);
+                                ipdv_max_abs = max(ipdv_max_abs, abs(ipdv_last));
+                            );
+                            prev_reported_ms = new_latency_ms;
+                            latency_ms     = new_latency_ms;
+                            hist[hist_pos] = latency_ms;
+                            hist_pos       = (hist_pos + 1) % hist_size;
+                            hist_filled    = min(hist_filled + 1, hist_size);
+                            n_frames_locked += 1;
+
+                            ow_ring[ow_pos] = latency_ms;
+                            ow_pos = (ow_pos + 1) % OW_LEN;
+                            ow_count = min(ow_count + 1, OW_LEN);
+                            consecutive_outlier_rejects = 0;
+
+                            w_n += 1;
+                            d = latency_ms - w_mean;
+                            w_mean += d / w_n;
+                            w_m2 += d * (latency_ms - w_mean);
+                            w_n == 1 ? (
+                                stat_min = latency_ms;
+                                stat_max = latency_ms;
+                            ) : (
+                                stat_min = min(stat_min, latency_ms);
+                                stat_max = max(stat_max, latency_ms);
+                            );
+
+                            // B4: telemetry (schema in the telemetry logger)
+                            gmem[0]    = 1;                 // schema version
+                            gmem[101]  = latency_ms;        // round-trip ms (as displayed)
+                            gmem[102]  = latency_samples;
+                            gmem[103]  = 1;                 // reporting (confident)
+                            gmem[104]  = SAMPLES_PER_BIT;
+                            gmem[105]  = dropped_frames;
+                            gmem[106]  = rejected_syncs;
+                            gmem[107]  = n_frames_locked;
+                            gmem[108]  = phase_err;
+                            gmem[109]  = srate;
+                            gmem[110]  = rejected_outliers;
+                            gmem[111]  = ipdv_last;
+                            gmem[112]  = samplesblock;
+                            // per-frame ring so the logger captures the full
+                            // 62.5-500 Hz stream: 1024 entries x 4 slots at
+                            // base 1000; the seq slot is written LAST
+                            tele_seq  += 1;
+                            tele_base  = 1000 + tele_ring_idx * 4;
+                            gmem[tele_base + 1] = latency_ms;
+                            gmem[tele_base + 2] = ipdv_last;
+                            gmem[tele_base + 3] = latency_samples;
+                            gmem[tele_base]     = tele_seq;
+                            gmem[100]  = tele_seq;          // LTC sequence counter
+                            tele_ring_idx += 1;
+                            tele_ring_idx >= 1024 ? tele_ring_idx = 0;
+                        );
+                    );
+                    n_frames_total += 1;
+                    n_violations    = 0;
+                ) : (
+                    // false sync match (or false lock): latency untouched
+                    rejected_syncs += 1;
+                    consecutive_rejects += 1;
+                    consecutive_rejects >= 4 ? (
+                        // baseline is garbage: drop the lock and re-acquire
+                        locked_phase = -1;
+                        confidence = 0;
+                        n_violations = 0;
+                        consecutive_rejects = 0;
+                        phase_err = 0;
+                        memset(phase_shift_lo, 0, MAX_PHASES);
+                        memset(phase_shift_hi, 0, MAX_PHASES);
+                        memset(phase_bits_seen, 0, MAX_PHASES);
+                        memset(phase_votes, 0, VOTE_SLOTS);
+                    );
+                );
+            );
+        ) : (
+            n_violations += 1;
+            n_violations >= 3 ? (
+                locked_phase = -1;
+                confidence = 0;
+                n_violations = 0;
+                consecutive_rejects = 0;
+                phase_err = 0;
+                memset(phase_shift_lo, 0, MAX_PHASES);
+                memset(phase_shift_hi, 0, MAX_PHASES);
+                memset(phase_bits_seen, 0, MAX_PHASES);
+                memset(phase_votes, 0, VOTE_SLOTS);
+            );
+        );
+    );
+);
+
+// ======================= TRANSMIT (encoder) ===============================
+// Emit the next biphase-mark sample, stamping each frame with the SAME
+// internal counter (current_sample) the decode path referenced above -- that
+// shared counter is what makes this a self-contained round-trip.  Arithmetic
+// only on the payload path (bitwise >> would destroy the counter at 2^31).
+// tx_i/tx_tmp are dedicated names so the
+// @gfx thread's own loop counters can never race this loop.
+generator_enabled ? (
+    tx_reset_done = 0;   // while transmitting, arm the stop-reset
+
+    (tx_bit_index == 0) && (tx_bit_pos == 0) ? (
+        tx_frame_lo = floor(current_sample);
+        tx_frame_lo -= floor(tx_frame_lo / 4294967296) * 4294967296;  // mod 2^32
+        tx_frame_lo < 0 ? tx_frame_lo += 4294967296;
+        tx_tmp = tx_frame_lo;
+        tx_i = 0;
+        loop(DATA_BITS,
+            tx_bits_buf[tx_i] = tx_tmp - floor(tx_tmp / 2) * 2;
+            tx_tmp = floor(tx_tmp / 2);
+            tx_i += 1;
+        );
+        tx_frame_count += 1;
+    );
+
+    tx_cur_bit = tx_bits_buf[tx_bit_index];
+    tx_bit_pos == 0 ? tx_level = -tx_level;                            // boundary: always
+    (tx_bit_pos == mid_pos) && (tx_cur_bit == 1) ? tx_level = -tx_level; // mid-bit: iff 1
+
+    spl0 = tx_level * amplitude;
+    spl1 = spl0;
+
+    tx_bit_pos += 1;
+    tx_bit_pos >= SAMPLES_PER_BIT ? (
+        tx_bit_pos = 0;
+        tx_bit_index += 1;
+        tx_bit_index >= FRAME_BITS ? tx_bit_index = 0;
+    );
+) : (
+    spl0 = 0;
+    spl1 = 0;
+    // reset the transmit frame once when muted, so a later ON resumes with a
+    // clean, freshly-stamped frame instead of the stale tail (mirrors the
+    // reference encoder's reset_done_after_stop)
+    tx_reset_done == 0 ? (
+        tx_level = 1;
+        tx_bit_pos = 0;
+        tx_bit_index = 0;
+        tx_reset_done = 1;
+    );
+);
+
+// ======================= SHARED GUI SPEC (both monitors) ====================
+// Identical anatomy to mls_roundtrip.jsfx so the two can be read side by side
+// without re-learning the layout. Keep them in step.
+//   width 680  -> two windows fit next to each other on a 1440-wide screen
+//   y  8..52   [status box LEFT] [ONE-WAY headline] [Generator button RIGHT]
+//   y 62..94   info lines, left column
+//   y 112..128 statistics, left column (split over two lines so 680 suffices)
+//   y 146      input level bar
+//   y 164..    trace plot
+// The headline is ONE-WAY in BOTH plugins (here = round-trip/2, no Cpb); the
+// round trip is shown under it. Long lines are split, never widened.
+// This is a ROUND-TRIP monitor: one-way assumes a symmetric path.
+// ===========================================================================
+@gfx 680 340
+
+// ---- generator button: top-RIGHT in both plugins ----
+button_w = 152; button_h = 26;
+button_x = gfx_w - button_w - 12; button_y = 8;
+mouse_ldn = mouse_cap & 1;
+(mouse_ldn && (mouse_left_was_down == 0))
+    && (mouse_x >= button_x) && (mouse_x <= button_x + button_w)
+    && (mouse_y >= button_y) && (mouse_y <= button_y + button_h) ?
+        generator_enabled = 1 - generator_enabled;
+mouse_left_was_down = mouse_ldn;
+
+gfx_r=0.07; gfx_g=0.07; gfx_b=0.10; gfx_a=1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+now_tick = sample_clock;
+last_sync_tick   >= 0 ? sync_age_ms  = (now_tick - last_sync_tick)   / srate * 1000 : sync_age_ms  = 999999;
+last_signal_tick >= 0 ? input_age_ms = (now_tick - last_signal_tick) / srate * 1000 : input_age_ms = 999999;
+no_input  = (last_signal_tick < 0) || (input_age_ms > connection_timeout_ms);
+connected = (locked_phase >= 0) && (confidence >= required_confidence) && (sync_age_ms <= adaptive_timeout_ms);
+acquiring = (locked_phase >= 0) && (confidence < required_confidence) && !no_input;
+lost      = !connected && !acquiring && ever_seen_ltc && (sync_age_ms > adaptive_timeout_ms);
+
+// ---- status box: top-LEFT in both plugins ----
+st_x = 12; st_y = 8; st_w = 200; st_h = 44;
+generator_enabled == 0 ? ( gfx_r=0.36; gfx_g=0.10; gfx_b=0.10; ) :
+connected ? ( gfx_r=0.05; gfx_g=0.34; gfx_b=0.16; ) :
+acquiring ? ( gfx_r=0.45; gfx_g=0.34; gfx_b=0.06; ) :
+lost      ? ( gfx_r=0.50; gfx_g=0.18; gfx_b=0.05; ) :
+no_input  ? ( gfx_r=0.36; gfx_g=0.10; gfx_b=0.10; ) :
+            ( gfx_r=0.12; gfx_g=0.18; gfx_b=0.34; );
+gfx_a=1; gfx_rect(st_x, st_y, st_w, st_h);
+gfx_setfont(1, "Arial", 20);
+gfx_r=0.92; gfx_g=0.96; gfx_b=1.00;
+gfx_x=st_x+12; gfx_y=st_y+12;
+generator_enabled == 0 ? gfx_printf("GENERATOR OFF") :
+connected ? gfx_printf("LOCKED") :
+acquiring ? gfx_printf("ACQUIRING %d/%d", confidence, required_confidence) :
+lost      ? gfx_printf("SIGNAL LOST") :
+no_input  ? gfx_printf("NO INPUT") :
+            gfx_printf("SEARCHING");
+gfx_setfont(0);
+
+// ---- headline: ONE-WAY (same position and meaning as the MLS monitor) ----
+gfx_setfont(1, "Arial", 22);
+connected ? ( gfx_r=1.0; gfx_g=0.9; gfx_b=0.3; ) : ( gfx_r=0.45; gfx_g=0.45; gfx_b=0.52; );
+gfx_x=224; gfx_y=10;
+connected ? gfx_printf("%.3f ms", latency_ms * 0.5) : gfx_printf("--.--- ms");
+gfx_setfont(0);
+gfx_r=0.55; gfx_g=0.59; gfx_b=0.66;
+gfx_x=224; gfx_y=36;
+// Kept short: at x=224 this must not reach the button hint at x=gfx_w-152.
+// Samples (not ms) also matches the MLS monitor's sub-headline exactly.
+connected ? gfx_printf("one-way = RT/2 | RT %.0f smp", latency_samples)
+          : gfx_printf("one-way = RT/2 | RT --");
+
+// ---- generator button face ----
+generator_enabled ? ( gfx_r=0.10; gfx_g=0.38; gfx_b=0.16; )
+                  : ( gfx_r=0.38; gfx_g=0.12; gfx_b=0.12; );
+gfx_a=1; gfx_rect(button_x, button_y, button_w, button_h);
+gfx_r=0.80; gfx_g=0.84; gfx_b=0.90; gfx_rect(button_x, button_y, button_w, button_h, 0);
+gfx_x=button_x+12; gfx_y=button_y+6;
+generator_enabled ? gfx_printf("Generator: ON") : gfx_printf("Generator: OFF");
+gfx_r=0.46; gfx_g=0.50; gfx_b=0.58;
+gfx_x=button_x+12; gfx_y=button_y+30;
+gfx_printf("click to mute TX");
+
+// ---- info lines ----
+gfx_r=0.72; gfx_g=0.76; gfx_b=0.84; gfx_a=1;
+gfx_x=12; gfx_y=62;
+gfx_printf("%.1f fps | %d smp/bit | frame %d smp (%.3f ms) | amp %.2f",
+           mode_fps, SAMPLES_PER_BIT, SAMPLES_PER_FRAME, frame_ms, amplitude);
+
+gfx_x=12; gfx_y=78;
+gfx_printf("resolution +/-%.4f ms | sync age %.1f ms | phase %d | corr %+d",
+           sample_ms, sync_age_ms, locked_phase, phase_err);
+
+gfx_x=12; gfx_y=94;
+gfx_printf("frames %.0f | dropped %.0f | rej sync %.0f | violations %.0f | sent %.0f",
+           n_frames_locked, dropped_frames, rejected_syncs, n_violations, tx_frame_count);
+
+// ---- statistics (B2), split over two lines so the window stays 680 ----
+p50 = 0; p95 = 0; p99 = 0;
+hist_filled >= 8 ? (
+    i = 0;
+    loop(hist_filled,
+        idx = (hist_pos - hist_filled + i + hist_size) % hist_size;
+        gfx_scratch[i] = hist[idx];
+        i += 1;
+    );
+    insertion_sort_gfx(gfx_scratch, hist_filled);
+    p50 = sorted_pct(gfx_scratch, hist_filled, 0.50);
+    p95 = sorted_pct(gfx_scratch, hist_filled, 0.95);
+    p99 = sorted_pct(gfx_scratch, hist_filled, 0.99);
+);
+stat_std = w_n  > 1 ? sqrt(w_m2 / (w_n - 1)) : 0;
+ipdv_std = ipdv_n > 1 ? sqrt(ipdv_m2 / (ipdv_n - 1)) : 0;
+
+gfx_r=0.72; gfx_g=0.76; gfx_b=0.84;
+gfx_x=12; gfx_y=112;
+gfx_printf("RT ms: mean %.3f | std %.3f | min %.3f | max %.3f",
+           w_mean, stat_std, stat_min, stat_max);
+gfx_x=12; gfx_y=128;
+gfx_printf("p50 %.3f | p95 %.3f | p99 %.3f | n %.0f | outliers %.0f (k=%.1f)",
+           p50, p95, p99, w_n, rejected_outliers, outlier_k);
+gfx_x=12; gfx_y=144;
+gfx_printf("IPDV ms: last %+.3f | std %.3f | max |.| %.3f",
+           ipdv_last, ipdv_std, ipdv_max_abs);
+
+// ---- input level bar ----
+bar_x = 12; bar_y = 162; bar_w = gfx_w - 24; bar_h = 8;
+gfx_r=0.15; gfx_g=0.15; gfx_b=0.20; gfx_a=1;
+gfx_rect(bar_x, bar_y, bar_w, bar_h);
+no_input ? ( gfx_r=0.60; gfx_g=0.18; gfx_b=0.18; )
+         : ( gfx_r=0.20; gfx_g=0.65; gfx_b=0.95; );
+gfx_rect(bar_x, bar_y, min(bar_w, bar_w * display_peak), bar_h);
+
+// ---- trace plot ----
+plot_top = 180;
+plot_h   = gfx_h - plot_top - 12;
+num_lines = 5;
+i = 0;
+loop(num_lines + 1,
+    y      = plot_top + plot_h * i / num_lines;
+    ms_val = max_disp * (num_lines - i) / num_lines;
+    gfx_r=0.18; gfx_g=0.18; gfx_b=0.24; gfx_a=1;
+    gfx_line(44, y, gfx_w - 8, y);
+    gfx_r=0.45; gfx_g=0.45; gfx_b=0.55;
+    gfx_x=6; gfx_y=y-6;
+    gfx_printf("%.1f", ms_val);
+    i += 1;
+);
+gfx_r=0.35; gfx_g=0.35; gfx_b=0.50;
+gfx_x=6; gfx_y=plot_top + plot_h - 16;
+gfx_printf("ms");
+
+num_pts = min(hist_size, gfx_w - 60);
+i = 0;
+loop(num_pts,
+    idx = (hist_pos - num_pts + i + hist_size) % hist_size;
+    val = hist[idx];
+    x   = 46 + (gfx_w - 56) * i / num_pts;
+    y   = plot_top + plot_h * (1.0 - val / max_disp);
+    y   = max(plot_top, min(plot_top + plot_h, y));
+    i == 0 ? (
+        gfx_x = x; gfx_y = y;
+    ) : (
+        connected ? ( gfx_r=0.25; gfx_g=0.65; gfx_b=0.95; )
+                  : ( gfx_r=0.75; gfx_g=0.42; gfx_b=0.20; );
+        gfx_a=1;
+        gfx_lineto(x, y);
+    );
+    i += 1;
+);

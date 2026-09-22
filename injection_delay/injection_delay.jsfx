@@ -1,0 +1,53 @@
+desc: AudioNet-Gda Injection Delay (exact integer-sample, for linearity tests)
+//tags: utility delay test
+//author: Department of Multimedia Systems, Gdansk University of Technology
+options:gmem=audionet_gda
+
+// Sample-accurate integer delay line for the injection-linearity harness
+// (TASKS C2).  slider1 is the delay in samples; parameter index 0.  The
+// companion ReaScript linearity harness sets this parameter
+// to known values and checks that the monitor's round-trip reading tracks it
+// 1:1.  Insert one instance anywhere in the measurement loop (traversed once
+// per round trip).  Two independent ring buffers, exact for delays below
+// MAXDELAY-1 (~5.46 s at 48 kHz).
+//
+// It also publishes its current delay to gmem[300] so the harness can verify
+// the parameter landed (belt-and-braces against TrackFX_SetParam range quirks).
+
+slider1:0<0,262143,1>Delay (samples)
+
+@init
+MAXDELAY = 262144;            // 2^18
+bufmask  = MAXDELAY - 1;
+buf0     = 0;
+buf1     = MAXDELAY;
+memset(buf0, 0, MAXDELAY);
+memset(buf1, 0, MAXDELAY);
+wpos     = 0;
+delay    = min(max(0, floor(slider1 + 0.5)), MAXDELAY - 1);
+
+@slider
+delay = min(max(0, floor(slider1 + 0.5)), MAXDELAY - 1);
+gmem[300] = delay;            // report the applied delay for the harness
+
+@sample
+buf0[wpos] = spl0;
+buf1[wpos] = spl1;
+// + MAXDELAY keeps the operand non-negative before the mask (no reliance on
+// two's-complement behaviour of & on a negative value)
+rpos = (wpos - delay + MAXDELAY) & bufmask;
+spl0 = buf0[rpos];
+spl1 = buf1[rpos];
+wpos = (wpos + 1) & bufmask;
+
+@gfx 320 90
+gfx_r=0.07; gfx_g=0.07; gfx_b=0.10; gfx_a=1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+gfx_r=0.80; gfx_g=0.84; gfx_b=0.90;
+gfx_setfont(1, "Arial", 20);
+gfx_x=12; gfx_y=14;
+gfx_printf("Injection Delay");
+gfx_setfont(0);
+gfx_r=0.72; gfx_g=0.76; gfx_b=0.84;
+gfx_x=12; gfx_y=46;
+gfx_printf("%d samples = %.3f ms @ %.0f Hz", delay, delay / srate * 1000, srate);
