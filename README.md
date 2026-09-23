@@ -1,3 +1,5 @@
+[![REAPER](https://img.shields.io/badge/REAPER-JSFX-1F6FEB.svg)]() [![Platform](https://img.shields.io/badge/platform-Dante%20AoIP-8A2BE2.svg)]() [![Status](https://img.shields.io/badge/status-thesis%20project-informational.svg)]() [![DOI](https://zenodo.org/badge/1382247985.svg)](https://zenodo.org/badge/latestdoi/1382247985) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 # Audio latency measurement tools
 
 Custom REAPER plugins developed as part of a master's thesis on **Networked Music Performance (NMP)** using the **Dante Audio-over-IP protocol**.
@@ -8,8 +10,8 @@ The project focuses on real-time measurement and monitoring of audio latency in 
 
 The plugins were developed to enable continuous, sample-accurate latency measurements in a round-trip configuration. Two measurement methods were implemented:
 
-- **MLS Monitor** — latency measurement based on Maximum Length Sequence (MLS) correlation.
-- **Adaptive Timecode** — a custom adaptive timecode inspired by SMPTE LTC, designed for continuous latency and stability monitoring.
+- **MLS Monitor** - latency measurement based on Maximum Length Sequence (MLS) correlation.
+- **Adaptive Timecode** - a custom adaptive timecode inspired by SMPTE LTC, designed for continuous latency and stability monitoring.
 
 Both tools were implemented as custom **REAPER** plugins and can be used to evaluate the behaviour of networked audio paths under different conditions.
 
