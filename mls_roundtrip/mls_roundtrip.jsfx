@@ -1,0 +1,660 @@
+desc: AudioNet-Gda MLS Round-Trip Monitor v3.0 (single plugin, no transport)
+//tags: analysis meter generator
+//author: Department of Multimedia Systems, Gdansk University of Technology
+options:gmem=audionet_gda
+
+// =============================================================================
+// AudioNet-Gda Round-Trip MLS Latency Monitor
+// =============================================================================
+//
+// v3.0 (15 Jul 2026) -- SUITE VERSION. mls_roundtrip.jsfx and ltc_roundtrip.jsfx
+// now share one architecture, which is what the major bump marks:
+//     single plugin - no transport - free-running internal counter -
+//     median/MAD outlier gate - running statistics - gmem telemetry
+// Use these two together; they differ only in modulation (MLS correlation vs
+// biphase-mark timecode) and therefore in update rate and robustness.
+//
+//   * B1: FFT circular cross-correlation (2 x 8192-point FFT per update,
+//     ~50x fewer operations than brute force).  The brute-force path is kept
+//     as a reference engine and a Verify mode runs both and counts
+//     disagreements -- leave Verify on for one session after any change.
+//   * A5: running median/MAD outlier gate with visible rejected counter and
+//     a 16-consecutive-rejects escape (accepts a genuine path change).
+//   * B2: running mean/std/min/max and p50/p95/p99 of the trace.
+//   * B4: publishes current values to gmem["audionet_gda"] for the
+//     companion CSV logger.
+//   * Runs regardless of transport, like a typical Reaper generator (the
+//     measurement never reads the transport; the Generator button mutes).
+//   * Fixed a latent cross-thread race on loop counters shared between the
+//     @block correlation and @gfx (present since v2.1); ext_noinit keeps
+//     statistics and telemetry across playback starts.
+//
+// PURPOSE
+//   Real-time one-way latency measurement that does NOT require MTC transport
+//   sync, by sending a Maximum-Length Sequence (MLS) from Machine A through
+// Dante to Machine B, where it is immediately retransmitted and returned to Machine A.  Machine A
+//   correlates what it sent against what it received back, finds the
+//   round-trip delay as the correlation peak, and reports half of that delay
+//   (minus the known passthrough buffer correction) as the one-way latency.
+//
+// WHY THIS AVOIDS THE START-OFFSET PROBLEM
+//   Machine A's program counter (call it t_A) appears on both sides of the
+//   comparison.  The "sender" path uses t_A as the index into the MLS table
+//   and the "receiver" path uses t_A as the timestamp of arrival.  Machine
+//   B's clock never enters the comparison -- B is a passive relay.  The
+//   t_A term cancels exactly, with no calibration required.
+//
+// WHY MLS NOT SINE
+//   Continuous sine has periodic autocorrelation -- one peak per period -- so
+//   cross-correlation yields infinite ambiguous answers.  MLS of order N has
+//   period 2^N - 1 samples and an autocorrelation that is N at lag zero (the
+//   sequence length) and -1 everywhere else.  One sharp unambiguous peak.
+//
+//   At MLS order 12 -- 4095 samples = 85.3 ms at 48 kHz -- the unambiguous
+//   range is 85.3 ms round-trip = 42.6 ms one-way.  This avoids the previous
+//   wrap-around problem where delays above about 10.6 ms one-way were reported
+//   as small values because the peak wrapped modulo the MLS period.
+//
+// PASSTHROUGH CORRECTION
+//   Machine B's passthrough is a no-op in DSP terms but contributes
+//   the audio interface's input -> output latency (the buffer round-trip
+//   internal to its driver and Reaper's audio engine).  This is a fixed
+//   property of B's hardware and configuration, not a measurement we need to
+//   make.  Half of it is subtracted from the round-trip total when computing
+//   one-way delay.
+//
+// FFT CORRELATION (B1)
+//   corr = IFFT( conj(FFT(template)) . FFT(rx) ), both zero-padded to 8192.
+//   MLS_LEN = 4095 is not a power of two, so the linear result is folded to
+//   the MLS period:  circ[lag] = lin[lag] + lin[4097 + lag].  This indexing
+//   is validated bit-for-bit against brute force.
+//   FFT(template) is conjugated once in @init.  fft/convolve_c/ifft operate
+//   on the same (permuted) bin order, so no fft_permute is needed for pure
+//   convolution.  Peak search uses |.|, so the missing 1/N scaling and any
+//   polarity inversion of the loop are irrelevant.
+// =============================================================================
+
+// Default 0, not the old placeholder of 1 (TASKS A4). C_pb removes the FAR
+// END'S HOST buffering, traversed once per round trip. The AudioNet-Gda far end
+// is a standalone Dante device routing Rx->Tx with no computer, so there is no
+// host buffering to remove and C_pb = 0 is physically correct -- the far end's
+// Dante Rx de-jitter is part of the path and must stay in the measurement.
+// Set this only if a far-end HOST is reintroduced (then it is that host's
+// in+out buffering, 64-256+ samples; measure it, do not guess -- guide 4.6).
+// With C_pb = 0 the one-way here equals RT/2, matching ltc_roundtrip.jsfx.
+slider1:0<0,256,1>Passthrough buffer correction (samples)
+slider2:20<1,100,0.5>Display range (ms)
+slider3:20<1,100,0.5>Update rate (Hz)
+slider4:0.5<0.05,1.0,0.01>Output amplitude
+slider5:0.0001<0,0.1,0.0001>Input signal threshold
+slider6:0<0,2,1{FFT (fast),Brute force (reference),Verify (both + mismatch count)}>Correlation engine
+slider7:6<0,16,0.5>Outlier gate (k x MAD, 0 = off)
+
+@init
+// Without this, REAPER re-runs @init on every playback start, wiping the
+// statistics and telemetry counters and forcing the generator button back ON
+// (and a restarted seq counter stalls the CSV logger's drain).  Per-run
+// state is reset by the transport-stop path in @sample instead.
+ext_noinit      = 1;
+
+// ----- Constants -----------------------------------------------------------
+MLS_ORDER       = 12;
+MLS_LEN         = 4095;           // 2^MLS_ORDER - 1
+HIST_LEN        = 512;            // history points for display trace
+FFT_N           = 8192;           // zero-padded FFT size (power of two)
+FOLD_OFF        = FFT_N - MLS_LEN;   // 4097: fold offset, see header
+OW_LEN          = 32;             // outlier-gate window (accepted values)
+
+// ----- Memory layout -------------------------------------------------------
+//   mls_template[0..MLS_LEN-1]   : the MLS reference sequence (+/-1)
+//   rx_buffer[0..MLS_LEN-1]      : received signal, indexed by tx_pos at write
+//   rx_snapshot[0..MLS_LEN-1]    : frozen copy of rx_buffer used during correlation
+//   hist[0..HIST_LEN-1]          : recent latency_ms values for display trace
+//   ow_ring / ow_scratch         : outlier-gate window and sort scratch
+//   gfx_scratch[0..HIST_LEN-1]   : @gfx percentile sort scratch
+//   fft_tpl / fft_work           : interleaved complex FFT buffers.  Placed at
+//                                  65536 and 81920 so neither crosses a
+//                                  65,536-item boundary (FFT requirement).
+mls_template    = 0;
+rx_buffer       = MLS_LEN;
+rx_snapshot     = MLS_LEN * 2;
+hist            = MLS_LEN * 3;
+ow_ring         = hist + HIST_LEN;
+ow_scratch      = ow_ring + OW_LEN;
+gfx_scratch     = ow_scratch + OW_LEN;
+fft_tpl         = 65536;
+fft_work        = 65536 + FFT_N * 2;
+memset(hist, 0, HIST_LEN);
+
+// ----- MLS generation via Fibonacci LFSR -----------------------------------
+// Polynomial: x^12 + x^6 + x^4 + x + 1
+// State convention: bit 0 = LSB = output bit; bit 11 = MSB = where new bit
+// enters.  Taps at positions 12, 6, 4 and 1 correspond to
+// bits 0, 6, 8 and 11 in this convention; we XOR those to compute the feedback bit.
+// The bitwise operators are safe here: lfsr_state stays below 2^12, far from
+// the 2^31 conversion horizon.  Sequence verified
+// maximal-length (period 4095, autocorrelation 4095 / -1).
+lfsr_state      = 1;
+i = 0;
+loop(MLS_LEN,
+    output_bit  = lfsr_state & 1;
+    mls_template[i] = output_bit ? 1.0 : -1.0;
+    fb          = ((lfsr_state >> 0) ^ (lfsr_state >> 6) ^ (lfsr_state >> 8) ^ (lfsr_state >> 11)) & 1;
+    lfsr_state  = (lfsr_state >> 1) | (fb << 11);
+    i += 1;
+);
+
+// ----- Template spectrum, conjugated once ----------------------------------
+i = 0;
+loop(MLS_LEN,
+    fft_tpl[2*i]     = mls_template[i];
+    fft_tpl[2*i + 1] = 0;
+    i += 1;
+);
+memset(fft_tpl + MLS_LEN * 2, 0, (FFT_N - MLS_LEN) * 2);
+fft(fft_tpl, FFT_N);
+i = 0;
+loop(FFT_N,
+    fft_tpl[2*i + 1] = -fft_tpl[2*i + 1];   // conj: bin order irrelevant
+    i += 1;
+);
+
+// ----- Helper functions ----------------------------------------------------
+function insertion_sort(buf, n) local(i, j, v) (
+    i = 1;
+    while (i < n) (
+        v = buf[i];
+        j = i - 1;
+        while ((j >= 0) && (buf[j] > v)) (
+            buf[j + 1] = buf[j];
+            j -= 1;
+        );
+        buf[j + 1] = v;
+        i += 1;
+    );
+);
+
+// @gfx-only copy: EEL2 function locals are STATIC, so one sort shared between
+// the audio thread (outlier gate) and the UI thread (percentiles) would race
+function insertion_sort_gfx(buf, n) local(i, j, v) (
+    i = 1;
+    while (i < n) (
+        v = buf[i];
+        j = i - 1;
+        while ((j >= 0) && (buf[j] > v)) (
+            buf[j + 1] = buf[j];
+            j -= 1;
+        );
+        buf[j + 1] = v;
+        i += 1;
+    );
+);
+
+// @gfx-only
+function sorted_pct(buf, n, p) local(idx) (
+    idx = floor(p * (n - 1) + 0.5);
+    buf[idx];
+);
+
+// median and MAD of the outlier window -> g_med, g_mad
+function window_median_mad() local(i, n) (
+    n = ow_count;
+    i = 0;
+    loop(n, ow_scratch[i] = ow_ring[i]; i += 1; );
+    insertion_sort(ow_scratch, n);
+    g_med = (n % 2) ? ow_scratch[floor(n/2)]
+                    : 0.5 * (ow_scratch[n/2 - 1] + ow_scratch[n/2]);
+    i = 0;
+    loop(n, ow_scratch[i] = abs(ow_scratch[i] - g_med); i += 1; );
+    insertion_sort(ow_scratch, n);
+    g_mad = (n % 2) ? ow_scratch[floor(n/2)]
+                    : 0.5 * (ow_scratch[n/2 - 1] + ow_scratch[n/2]);
+);
+
+function stats_reset() (
+    ow_count = 0;
+    ow_pos = 0;
+    w_n = 0; w_mean = 0; w_m2 = 0;
+    stat_min = 0; stat_max = 0;
+    consecutive_outlier_rejects = 0;
+    hist_filled = 0;   // restart the percentile window too
+);
+
+// Publish one completed correlation result: A5 gate, stats, history, gmem.
+// The displayed globals are written only on ACCEPT, so a rejected outlier
+// never leaks an inconsistent RT-samples/latency pair to the display.
+function publish_result(rt_lag) local(new_ms, is_outlier, d) (
+    new_ms             = (rt_lag - pb_correction) * 0.5 / srate * 1000;
+
+    // A5: running median/MAD gate (needs a part-filled window first)
+    is_outlier = 0;
+    (outlier_k > 0) && (ow_count >= 8) ? (
+        window_median_mad();
+        g_mad = max(g_mad, 0.021);  // floor: ~1 sample one-way @ 48 kHz
+        abs(new_ms - g_med) > outlier_k * g_mad ? is_outlier = 1;
+    );
+    is_outlier ? (
+        rejected_outliers += 1;
+        consecutive_outlier_rejects += 1;
+        // escape hatch: a persistent shift is a real path change -- restart
+        consecutive_outlier_rejects >= 16 ? ( stats_reset(); is_outlier = 0; );
+    );
+
+    is_outlier == 0 ? (
+        round_trip_samples = rt_lag;
+        one_way_samples    = (rt_lag - pb_correction) * 0.5;
+        latency_ms = new_ms;
+        hist[hist_pos] = latency_ms;
+        hist_pos = (hist_pos + 1) % HIST_LEN;
+        hist_filled = min(hist_filled + 1, HIST_LEN);
+
+        ow_ring[ow_pos] = new_ms;
+        ow_pos = (ow_pos + 1) % OW_LEN;
+        ow_count = min(ow_count + 1, OW_LEN);
+        consecutive_outlier_rejects = 0;
+
+        w_n += 1;
+        d = new_ms - w_mean;
+        w_mean += d / w_n;
+        w_m2 += d * (new_ms - w_mean);
+        w_n == 1 ? ( stat_min = new_ms; stat_max = new_ms; ) : (
+            stat_min = min(stat_min, new_ms);
+            stat_max = max(stat_max, new_ms);
+        );
+
+        n_updates += 1;
+        locked = 1;
+
+        // B4: telemetry block (schema in the telemetry logger)
+        gmem[0]   = 1;                    // schema version
+        gmem[201] = latency_ms;           // one-way ms (as displayed)
+        gmem[202] = round_trip_samples;
+        gmem[203] = locked;
+        gmem[204] = pb_correction;
+        gmem[205] = srate;
+        gmem[206] = samplesblock;
+        gmem[207] = rejected_outliers;
+        gmem[208] = n_updates;
+        gmem[209] = signal_rms;
+        gmem[210] = engine_sel;
+        gmem[211] = verify_mismatches;
+        // per-update ring: 512 entries x 3 slots at base 8000, seq slot LAST
+        tele_seq += 1;
+        tele_base = 8000 + tele_ring_idx * 3;
+        gmem[tele_base + 1] = latency_ms;
+        gmem[tele_base + 2] = round_trip_samples;
+        gmem[tele_base]     = tele_seq;
+        gmem[200] = tele_seq;             // MLS sequence counter
+        tele_ring_idx += 1;
+        tele_ring_idx >= 512 ? tele_ring_idx = 0;
+    );
+);
+
+// ----- Transmit / receive pointers -----------------------------------------
+tx_pos          = 0;
+hist_pos        = 0;
+hist_filled     = 0;
+
+// ----- Update timing -------------------------------------------------------
+samples_since_update    = 0;
+update_period_samples   = max(floor(srate / max(slider3, 0.5)), 256);
+
+// ----- Correlation state machine ------------------------------------------
+//   0 = idle; 1 = triggered (FFT pass pending and/or brute force in progress)
+corr_state              = 0;
+current_lag             = 0;
+best_lag                = 0;
+best_corr_abs           = 0;
+LAG_CHUNK_SIZE          = 32;     // brute-force lags per @block (reference
+                                  // engine; 32 x 4095 = ~131k MACs per block)
+fft_done                = 0;
+fft_best_lag            = 0;
+verify_mismatches       = 0;
+
+// ----- Reported values -----------------------------------------------------
+latency_ms              = 0;
+round_trip_samples      = 0;
+locked                  = 0;
+n_updates               = 0;
+rejected_outliers       = 0;
+signal_rms              = 0;
+reset_done_after_stop   = 0;
+tele_seq                = 0;
+tele_ring_idx           = 0;
+stats_reset();
+
+// ----- Display sliders -----------------------------------------------------
+pb_correction           = slider1;
+max_disp                = slider2;
+amplitude               = slider4;
+signal_threshold        = slider5;
+engine_sel              = floor(slider6 + 0.5);
+engine_prev             = engine_sel;
+outlier_k               = slider7;
+pb_prev                 = pb_correction;
+generator_enabled       = 1;      // toggled by the on-screen button
+mouse_left_was_down     = 0;
+
+@slider
+pb_correction           = slider1;
+max_disp                = slider2;
+update_period_samples   = max(floor(srate / max(slider3, 0.5)), 256);
+amplitude               = slider4;
+signal_threshold        = slider5;
+engine_sel              = floor(slider6 + 0.5);
+outlier_k               = slider7;
+
+// changing the correction shifts every value: restart the statistics
+pb_correction != pb_prev ? (
+    stats_reset();
+    pb_prev = pb_correction;
+);
+
+// abandon any in-flight correlation when the engine changes, or a pass can
+// strand with corr_state stuck at 1 (FFT done, brute force disabled)
+engine_sel != engine_prev ? (
+    corr_state = 0;
+    fft_done = 0;
+    engine_prev = engine_sel;
+);
+
+@sample
+// =============================================================================
+// AUDIO-RATE LOOP: transmit MLS, capture incoming, advance tx_pos
+// =============================================================================
+
+// No transport gate: the MLS measurement never reads the transport (tx_pos
+// is free-running), and the deployment is continuous monitoring where the
+// transport is usually stopped.  Like a typical Reaper generator it runs
+// whenever the FX processes audio; the Generator button is the only mute.
+// (The LTC encoder, by contrast, MUST gate on the play bit — its payload is
+// play_position.)
+generator_enabled ? (
+    reset_done_after_stop = 0;
+
+    // 1) Capture incoming sample FROM Machine B's loopback.
+    //    Important: read spl0 BEFORE overwriting it on the next line.
+    in_sample           = spl0;
+
+    // RMS gate: prevents fresh measurements when there is no returned signal.
+    signal_rms          = signal_rms * 0.999 + (in_sample * in_sample) * 0.001;
+
+    // 2) Store received sample at the CURRENT tx_pos.
+    rx_buffer[tx_pos]   = in_sample;
+
+    // 3) Emit the current MLS template sample on both output channels.
+    spl0                = mls_template[tx_pos] * amplitude;
+    spl1                = spl0;
+
+    // 4) Advance tx_pos, wrap on period boundary.
+    tx_pos += 1;
+    tx_pos >= MLS_LEN ? tx_pos = 0;
+
+    // 5) Trigger a new measurement when due and idle.
+    samples_since_update += 1;
+    ((samples_since_update >= update_period_samples) && (corr_state == 0)) ? (
+        samples_since_update = 0;
+        signal_rms > signal_threshold ? (
+            memcpy(rx_snapshot, rx_buffer, MLS_LEN);
+            corr_state          = 1;
+            current_lag         = 0;
+            best_lag            = 0;
+            best_corr_abs       = 0;
+            fft_done            = 0;
+        );
+    );
+) : (
+    // Generator switched off: silence, and reset runtime measurement state once.
+    spl0 = 0;
+    spl1 = 0;
+
+    reset_done_after_stop == 0 ? (
+        samples_since_update = 0;
+        corr_state = 0;
+        current_lag = 0;
+        best_lag = 0;
+        best_corr_abs = 0;
+        latency_ms = 0;
+        round_trip_samples = 0;
+        locked = 0;
+        signal_rms = 0;
+        fft_done = 0;
+        memset(rx_buffer, 0, MLS_LEN);
+        memset(rx_snapshot, 0, MLS_LEN);
+        reset_done_after_stop = 1;
+    );
+);
+
+@block
+// =============================================================================
+// CORRELATION ENGINES
+// =============================================================================
+
+// --- FFT engine: one complete pass per trigger (engine 0 and Verify) --------
+// NOTE: @block runs on the audio thread while @gfx runs on the UI thread and
+// SHARES globals and function-local statics.  All @block work variables here
+// are blk_-prefixed so they are disjoint from every @gfx variable (v2.1 raced
+// on idx between the two threads), and @gfx uses its own sort function.
+(corr_state == 1) && (engine_sel != 1) && (fft_done == 0) ? (
+    blk_i = 0;
+    loop(MLS_LEN,
+        fft_work[2*blk_i]     = rx_snapshot[blk_i];
+        fft_work[2*blk_i + 1] = 0;
+        blk_i += 1;
+    );
+    memset(fft_work + MLS_LEN * 2, 0, (FFT_N - MLS_LEN) * 2);
+    fft(fft_work, FFT_N);
+    convolve_c(fft_work, fft_tpl, FFT_N);
+    ifft(fft_work, FFT_N);
+
+    // fold linear correlation to the MLS period and |.|-argmax
+    fft_best_corr = -1;
+    blk_lag = 0;
+    loop(MLS_LEN,
+        blk_fold = abs(fft_work[2*blk_lag] + fft_work[2*(FOLD_OFF + blk_lag)]);
+        blk_fold > fft_best_corr ? (
+            fft_best_corr = blk_fold;
+            fft_best_lag  = blk_lag;
+        );
+        blk_lag += 1;
+    );
+    fft_done = 1;
+
+    engine_sel == 0 ? (
+        publish_result(fft_best_lag);
+        corr_state = 0;
+    );
+    // engine_sel == 2 (Verify): keep corr_state=1, brute force continues below
+);
+
+// --- Brute-force engine: amortised reference (engine 1 and Verify) ----------
+(corr_state == 1) && (engine_sel != 0) ? (
+    chunk = min(LAG_CHUNK_SIZE, MLS_LEN - current_lag);
+    loop(chunk,
+        corr_sum = 0;
+        blk_j = 0;
+        loop(MLS_LEN,
+            blk_idx = (blk_j + current_lag) % MLS_LEN;
+            corr_sum += mls_template[blk_j] * rx_snapshot[blk_idx];
+            blk_j += 1;
+        );
+        abs_corr = abs(corr_sum);
+        abs_corr > best_corr_abs ? (
+            best_corr_abs   = abs_corr;
+            best_lag        = current_lag;
+        );
+        current_lag += 1;
+    );
+
+    current_lag >= MLS_LEN ? (
+        (engine_sel == 2) && (best_lag != fft_best_lag) ? (
+            verify_mismatches += 1;
+            // keep the pair visible: a REVERSED fft convention would show
+            // fft ~= 4095 - bf consistently; random pairs = noise-floor ties
+            // on garbage input (both engines argmaxing numerical noise)
+            mism_bf_lag  = best_lag;
+            mism_fft_lag = fft_best_lag;
+        );
+        publish_result(best_lag);   // reference result wins in Verify mode
+        corr_state = 0;
+    );
+);
+
+// =============================================================================
+// GRAPHICS
+// =============================================================================
+// ======================= SHARED GUI SPEC (both monitors) ====================
+// mls_roundtrip.jsfx and ltc_roundtrip.jsfx use the SAME anatomy so they can be
+// read side by side without re-learning the layout. Keep them in step.
+//   width 680  -> two windows fit next to each other on a 1440-wide screen
+//   y  8..52   [status box LEFT] [ONE-WAY headline] [Generator button RIGHT]
+//   y 62..94   info lines, left column
+//   y 112..128 statistics, left column (split over two lines so 680 suffices)
+//   y 146      input level bar
+//   y 164..    trace plot
+// The headline is ONE-WAY in BOTH plugins; the round trip is shown under it.
+// Long lines are split rather than the window widened.
+// ===========================================================================
+@gfx 680 300
+
+// ---- generator button: top-RIGHT in both plugins ----
+button_w = 152; button_h = 26;
+button_x = gfx_w - button_w - 12; button_y = 8;
+mouse_left_down = mouse_cap & 1;
+(mouse_left_down && (mouse_left_was_down == 0))
+    && (mouse_x >= button_x) && (mouse_x <= button_x + button_w)
+    && (mouse_y >= button_y) && (mouse_y <= button_y + button_h) ? (
+        generator_enabled = 1 - generator_enabled;
+        reset_done_after_stop = 0;
+    );
+mouse_left_was_down = mouse_left_down;
+
+gfx_r=0.07; gfx_g=0.07; gfx_b=0.10; gfx_a=1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+// ---- status box: top-LEFT in both plugins ----
+st_x = 12; st_y = 8; st_w = 200; st_h = 44;
+generator_enabled == 0 ? ( gfx_r=0.36; gfx_g=0.10; gfx_b=0.10; ) :
+locked == 0            ? ( gfx_r=0.45; gfx_g=0.34; gfx_b=0.06; ) :
+                         ( gfx_r=0.05; gfx_g=0.34; gfx_b=0.16; );
+gfx_a=1; gfx_rect(st_x, st_y, st_w, st_h);
+gfx_setfont(1, "Arial", 20);
+gfx_r=0.92; gfx_g=0.96; gfx_b=1.00;
+gfx_x=st_x+12; gfx_y=st_y+12;
+generator_enabled == 0 ? gfx_printf("GENERATOR OFF") :
+locked == 0            ? gfx_printf("ACQUIRING")     :
+                         gfx_printf("LOCKED");
+gfx_setfont(0);
+
+// ---- headline: ONE-WAY (same position and meaning in both plugins) ----
+gfx_setfont(1, "Arial", 22);
+locked ? ( gfx_r=1.0; gfx_g=0.9; gfx_b=0.3; ) : ( gfx_r=0.45; gfx_g=0.45; gfx_b=0.52; );
+gfx_x=224; gfx_y=10;
+locked ? gfx_printf("%.3f ms", latency_ms) : gfx_printf("--.--- ms");
+gfx_setfont(0);
+gfx_r=0.55; gfx_g=0.59; gfx_b=0.66;
+gfx_x=224; gfx_y=36;
+gfx_printf("one-way = (RT-Cpb)/2 | RT %d smp", round_trip_samples);
+
+// ---- generator button face ----
+generator_enabled ? ( gfx_r=0.10; gfx_g=0.38; gfx_b=0.16; )
+                  : ( gfx_r=0.38; gfx_g=0.12; gfx_b=0.12; );
+gfx_a=1; gfx_rect(button_x, button_y, button_w, button_h);
+gfx_r=0.80; gfx_g=0.84; gfx_b=0.90; gfx_rect(button_x, button_y, button_w, button_h, 0);
+gfx_x=button_x+12; gfx_y=button_y+6;
+generator_enabled ? gfx_printf("Generator: ON") : gfx_printf("Generator: OFF");
+gfx_r=0.46; gfx_g=0.50; gfx_b=0.58;
+gfx_x=button_x+12; gfx_y=button_y+30;
+gfx_printf("click to mute TX");
+
+// ---- info lines ----
+gfx_r=0.72; gfx_g=0.76; gfx_b=0.84; gfx_a=1;
+gfx_x=12; gfx_y=62;
+gfx_printf("MLS order %d (%d smp) | update %.1f Hz | Cpb %.0f smp | amp %.2f",
+           MLS_ORDER, MLS_LEN, srate / update_period_samples, pb_correction, amplitude);
+
+gfx_x=12; gfx_y=78;
+engine_sel == 0 ? gfx_printf("engine FFT") :
+engine_sel == 1 ? gfx_printf("engine brute-force (reference)") :
+                  gfx_printf("engine VERIFY | mismatches %.0f (last bf %d / fft %d)",
+                             verify_mismatches, mism_bf_lag, mism_fft_lag);
+gfx_printf(" | updates %.0f", n_updates);
+
+gfx_x=12; gfx_y=94;
+gfx_printf("input rms %.6f | threshold %.4f", signal_rms, signal_threshold);
+
+// ---- statistics (B2), split over two lines so the window stays 680 ----
+p50 = 0; p95 = 0; p99 = 0;
+hist_filled >= 8 ? (
+    i = 0;
+    loop(hist_filled,
+        idx = (hist_pos - hist_filled + i + HIST_LEN) % HIST_LEN;
+        gfx_scratch[i] = hist[idx];
+        i += 1;
+    );
+    insertion_sort_gfx(gfx_scratch, hist_filled);
+    p50 = sorted_pct(gfx_scratch, hist_filled, 0.50);
+    p95 = sorted_pct(gfx_scratch, hist_filled, 0.95);
+    p99 = sorted_pct(gfx_scratch, hist_filled, 0.99);
+);
+stat_std = w_n > 1 ? sqrt(w_m2 / (w_n - 1)) : 0;
+
+gfx_r=0.72; gfx_g=0.76; gfx_b=0.84;
+gfx_x=12; gfx_y=112;
+gfx_printf("one-way ms: mean %.3f | std %.3f | min %.3f | max %.3f",
+           w_mean, stat_std, stat_min, stat_max);
+gfx_x=12; gfx_y=128;
+gfx_printf("p50 %.3f | p95 %.3f | p99 %.3f | n %.0f | outliers %.0f (k=%.1f)",
+           p50, p95, p99, w_n, rejected_outliers, outlier_k);
+
+// ---- input level bar ----
+bar_x = 12; bar_y = 146; bar_w = gfx_w - 24; bar_h = 8;
+gfx_r=0.15; gfx_g=0.15; gfx_b=0.20; gfx_a=1;
+gfx_rect(bar_x, bar_y, bar_w, bar_h);
+lvl = min(1, sqrt(max(signal_rms, 0)) * 4);
+(signal_rms > signal_threshold) ? ( gfx_r=0.20; gfx_g=0.65; gfx_b=0.95; )
+                                : ( gfx_r=0.60; gfx_g=0.18; gfx_b=0.18; );
+gfx_rect(bar_x, bar_y, min(bar_w, bar_w * lvl), bar_h);
+
+// ---- trace plot ----
+plot_top = 164;
+plot_h   = gfx_h - plot_top - 12;
+num_lines = 5;
+i = 0;
+loop(num_lines + 1,
+    y      = plot_top + plot_h * i / num_lines;
+    ms_val = max_disp * (num_lines - i) / num_lines;
+    gfx_r=0.18; gfx_g=0.18; gfx_b=0.24; gfx_a=1;
+    gfx_line(44, y, gfx_w - 8, y);
+    gfx_r=0.45; gfx_g=0.45; gfx_b=0.55;
+    gfx_x=6; gfx_y=y-6;
+    gfx_printf("%.1f", ms_val);
+    i += 1;
+);
+gfx_r=0.35; gfx_g=0.35; gfx_b=0.50;
+gfx_x=6; gfx_y=plot_top + plot_h - 16;
+gfx_printf("ms");
+
+num_pts = min(HIST_LEN, gfx_w - 60);
+i = 0;
+loop(num_pts,
+    idx = (hist_pos - num_pts + i + HIST_LEN) % HIST_LEN;
+    val = hist[idx];
+    x   = 46 + (gfx_w - 56) * i / num_pts;
+    y   = plot_top + plot_h * (1.0 - val / max_disp);
+    y   = max(plot_top, min(plot_top + plot_h, y));
+    i == 0 ? (
+        gfx_x = x;  gfx_y = y;
+    ) : (
+        locked == 0 ? (
+            gfx_r=0.5; gfx_g=0.2; gfx_b=0.2;
+        ) : corr_state == 1 ? (
+            gfx_r=0.9; gfx_g=0.7; gfx_b=0.3;     // amber: correlating
+        ) : (
+            gfx_r=0.3; gfx_g=0.7; gfx_b=0.9;     // cyan: idle, last value valid
+        );
+        gfx_a = 1;
+        gfx_lineto(x, y);
+    );
+    i += 1;
+);
