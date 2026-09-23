@@ -1,4 +1,4 @@
-# Dante NMP Measurement Plugins
+# Audio latency measurement tools
 
 Custom REAPER plugins developed as part of a master's thesis on **Networked Music Performance (NMP)** using the **Dante Audio-over-IP protocol**.
 
