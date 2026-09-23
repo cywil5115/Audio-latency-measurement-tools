@@ -1,4 +1,4 @@
-[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.22918461-blue.svg)](https://doi.org/10.5281/zenodo.22918461) [![REAPER](https://img.shields.io/badge/REAPER-JSFX-1F6FEB.svg)]() [![Platform](https://img.shields.io/badge/platform-Dante%20AoIP-8A2BE2.svg)]() [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.22904494-blue.svg)](https://doi.org/10.5281/zenodo.22904494) [![REAPER](https://img.shields.io/badge/REAPER-JSFX-1F6FEB.svg)]() [![Platform](https://img.shields.io/badge/platform-Dante%20AoIP-8A2BE2.svg)]() [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 # Audio latency measurement tools
 
