@@ -36,7 +36,8 @@ options:gmem=audionet_gda
 // +/-1 sample; k-1 = dropped frames); boundary-vote phase-lock correction;
 // mod-2^32 latency unwrap; median/MAD outlier gate (A5); running stats incl.
 // RFC 3393 IPDV and p50/p95/p99 (B2); gmem telemetry for the CSV logger (B4).
-// The internal counter is float64-exact for ~1.9 years at 48 kHz; the 32-bit
+// The internal counter is float64-exact to 2^53 samples (~5,900 years at
+// 48 kHz); the 32-bit
 // payload wraps at 24.85 h and is unwrapped by the decode path.
 
 slider1:0<0,3,1{500 fps / 2 spb,250 fps / 4 spb,125 fps / 8 spb,62.5 fps / 16 spb}>FPS mode (TX and RX)
