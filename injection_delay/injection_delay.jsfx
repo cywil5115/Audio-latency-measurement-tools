@@ -1,4 +1,4 @@
-desc: AudioNet-Gda Injection Delay (exact integer-sample, for linearity tests)
+desc: AudioNet-Gda Injection Delay v1.2 (exact integer-sample, for linearity tests)
 //tags: utility delay test
 //author: Department of Multimedia Systems, Gdansk University of Technology
 options:gmem=audionet_gda
