@@ -131,15 +131,19 @@ memset(hist, 0, HIST_LEN);
 // State convention: bit 0 = LSB = output bit; bit 11 = MSB = where new bit
 // enters.  Taps at positions 12, 6, 4 and 1 correspond to
 // bits 0, 6, 8 and 11 in this convention; we XOR those to compute the feedback bit.
-// The bitwise operators are safe here: lfsr_state stays below 2^12, far from
-// the 2^31 conversion horizon.  Sequence verified
-// maximal-length (period 4095, autocorrelation 4095 / -1).
+// XOR in EEL2 is '~'.  '^' is pow: up to v1.1 of this repository this line
+// used '^', which made the "MLS" degenerate (arm64: constant level plus one
+// 11-sample dip per period; x86_64: near-alternation), never a maximal-length
+// sequence.  The bitwise operators are safe here: lfsr_state stays below 2^12,
+// far from the 2^31 conversion horizon.  The '~' form was verified
+// maximal-length (period 4095, autocorrelation 4095 / -1) in real EEL2 on
+// arm64 and x86_64, and runs in REAPER on Intel macOS.
 lfsr_state      = 1;
 i = 0;
 loop(MLS_LEN,
     output_bit  = lfsr_state & 1;
     mls_template[i] = output_bit ? 1.0 : -1.0;
-    fb          = ((lfsr_state >> 0) ^ (lfsr_state >> 6) ^ (lfsr_state >> 8) ^ (lfsr_state >> 11)) & 1;
+    fb          = ((lfsr_state >> 0) ~ (lfsr_state >> 6) ~ (lfsr_state >> 8) ~ (lfsr_state >> 11)) & 1;
     lfsr_state  = (lfsr_state >> 1) | (fb << 11);
     i += 1;
 );
