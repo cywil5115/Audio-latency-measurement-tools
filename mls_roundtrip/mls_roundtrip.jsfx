@@ -1,4 +1,4 @@
-desc: AudioNet-Gda MLS Round-Trip Monitor v3.0 (single plugin, no transport)
+desc: AudioNet-Gda MLS Round-Trip Monitor v1.2 (single plugin, no transport)
 //tags: analysis meter generator
 //author: Department of Multimedia Systems, Gdansk University of Technology
 options:gmem=audionet_gda
@@ -7,8 +7,13 @@ options:gmem=audionet_gda
 // AudioNet-Gda Round-Trip MLS Latency Monitor
 // =============================================================================
 //
-// v3.0 (15 Jul 2026) -- SUITE VERSION. mls_roundtrip.jsfx and ltc_roundtrip.jsfx
-// now share one architecture, which is what the major bump marks:
+// v1.2 (25 Sep 2026) -- the version now follows the repository release (the
+// same code was labelled v3.0 up to release v1.1).  Fixes the MLS generator:
+// XOR in EEL2 is '~'; '^' (pow) made the template degenerate (see the LFSR
+// block below).
+//
+// Architecture since v3.0 (15 Jul 2026), shared by mls_roundtrip.jsfx and
+// ltc_roundtrip.jsfx:
 //     single plugin - no transport - free-running internal counter -
 //     median/MAD outlier gate - running statistics - gmem telemetry
 // Use these two together; they differ only in modulation (MLS correlation vs

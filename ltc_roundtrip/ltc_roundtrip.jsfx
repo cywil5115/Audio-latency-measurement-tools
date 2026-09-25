@@ -1,10 +1,12 @@
-desc: AudioNet-Gda LTC Round-Trip Monitor v3.0 (single plugin, no transport)
+desc: AudioNet-Gda LTC Round-Trip Monitor v1.2 (single plugin, no transport)
 //tags: analysis meter synchronisation generator
 //author: Department of Multimedia Systems, Gdansk University of Technology
 options:gmem=audionet_gda
 
-// v3.0 -- SUITE VERSION. mls_roundtrip.jsfx and ltc_roundtrip.jsfx now share
-// one architecture, which is what the major bump marks:
+// v1.2 (25 Sep 2026) -- the version now follows the repository release (the
+// same code was labelled v3.0 up to release v1.1).  LTC code is unchanged.
+//
+// Architecture since v3.0, shared by ltc_roundtrip.jsfx and mls_roundtrip.jsfx:
 //     single plugin - no transport - free-running internal counter -
 //     median/MAD outlier gate - running statistics - gmem telemetry
 // They differ only in modulation (biphase-mark timecode vs MLS correlation)

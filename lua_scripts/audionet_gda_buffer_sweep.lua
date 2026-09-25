@@ -19,7 +19,7 @@ for the reading to settle, prompts once for the Dante latency at that point,
 and records the row. Repeat for each block size. Close the window to finish;
 the fit is then run by a separate R script.
 
-Requires a live v2.2 monitor (MLS or LTC) as for the linearity harness.
+Requires a live monitor plugin from this repository (MLS or LTC) as for the linearity harness.
 ]]--
 
 reaper.gmem_attach("audionet_gda")

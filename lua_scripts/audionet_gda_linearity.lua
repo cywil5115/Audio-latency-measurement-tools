@@ -7,7 +7,7 @@ at each, and write a CSV that is later fitted to a line
 (slope must be 1.000 samples per sample of injection).
 
 Requires, running in Reaper:
-  - one monitor plugin producing telemetry (MLS or LTC v2.2, gmem namespace "audionet_gda"), locked
+  - one monitor plugin producing telemetry (MLS or LTC from this repository, gmem namespace "audionet_gda"), locked
     and reporting;
   - one injection_delay.jsfx inserted in the measurement loop (traversed once
     per round trip); parameter 0 = delay in samples.

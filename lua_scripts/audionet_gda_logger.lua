@@ -1,7 +1,7 @@
 --[[
 AudioNet-Gda telemetry logger (TASKS B4)
 
-Companion to the LTC and MLS monitor v2.2 plugins
+Companion to the LTC and MLS monitor plugins in this repository
 (both publish into gmem namespace "audionet_gda").  Drains the per-value
 gmem rings so the FULL 62.5-500 Hz LTC stream is captured, not a subsample,
 and appends one CSV row per value with a wall-clock timestamp.
